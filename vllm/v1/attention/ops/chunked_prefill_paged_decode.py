@@ -337,25 +337,6 @@ def _try_flash_decode(
     Returns True if the fast path was taken (output is written), False if
     the caller must run its standard implementation.
     """
-    # One-shot gate diagnostics (removed once the real-serving path is
-    # confirmed; first 3 calls only).
-    if _FLASH_DEBUG_LOGGER.calls < 3:
-        _FLASH_DEBUG_LOGGER.calls += 1
-        logger.info(
-            "[flash-decode gate] call #%d: num_tokens=%s "
-            "q_shape=%s q_dev=%s seq_dev=%s max_query_len=%s "
-            "seq_lens=%s dtype=%s kv_dtype=%s kv5_shape=%s kv4_shape=%s "
-            "kv5_strides=%s kv4_strides=%s bt_shape=%s bt_sample=%s",
-            _FLASH_DEBUG_LOGGER.calls,
-            query.shape[0], tuple(query.shape), query.device,
-            seq_lens.device, max_query_len, seq_lens.tolist(),
-            query.dtype, kv_cache_dtype,
-            tuple(key_cache.shape), tuple(value_cache.shape),
-            tuple(key_cache.stride()), tuple(value_cache.stride()),
-            tuple(block_table.shape),
-            block_table[:, :8].tolist() if block_table.shape[1] >= 8
-            else block_table.tolist(),
-        )
     if output_scale is not None:
         # no fused output quantization in the flash-decode path
         return False
@@ -447,6 +428,15 @@ def _try_flash_decode(
                       dtype=torch.float32)
     mid = torch.empty(n_sub, num_query_heads, splits, head_size + 1,
                       device=query.device, dtype=torch.float32)
+    if _FLASH_DEBUG_LOGGER.calls < 3:
+        _FLASH_DEBUG_LOGGER.calls += 1
+        logger.info(
+            "[flash-decode] call #%d ACCEPTED: lq=%s batch=%s seq_lens=%s "
+            "max_seq=%s PB=%s Hkv=%s heads=%s D=%s splits=%s",
+            _FLASH_DEBUG_LOGGER.calls, lq, batch, seq_lens.tolist(),
+            max_seq_len, real_block_size, key_cache.shape[1],
+            query.shape[1], head_size, splits,
+        )
     decode_attention_fwd_grouped(
         q=query,
         k_buffer=k_buf,
