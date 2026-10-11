@@ -15,8 +15,18 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .prefix_prefill import context_attention_fwd
+from .triton_decode_attention import decode_attention_fwd_grouped
 
 logger = init_logger(__name__)
+
+# K-split flash-decode tuning for gfx1100 (W7800: 52 CUs). Measured on
+# 2026-10-11 (docs/vllm-fork.md, containers repo): 100k-context fp8 KV
+# read in 1.14 ms with 52 splits (4 kv heads x 13) vs 106.7 ms for the
+# single-pass context kernel. Split length 8192 keeps each split's KV
+# tile small enough for the LDS budget at head_dim 256.
+_FLASH_DECODE_MAX_SPLITS = 52
+_FLASH_DECODE_SPLIT_LEN = 8192
+_FLASH_DECODE_MAX_LQ = 8
 
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
@@ -282,6 +292,143 @@ def kernel_paged_attention_2d(
     )
 
 
+def _try_flash_decode(
+    query,
+    output,
+    kv_cache_dtype,
+    key_cache,
+    value_cache,
+    block_table,
+    seq_lens,
+    max_seq_len,
+    max_query_len,
+    k_scale,
+    v_scale,
+    sm_scale,
+    alibi_slopes,
+    sliding_window,
+    sinks,
+    is_block_table_ptr,
+    causal,
+    output_scale=None,
+) -> bool:
+    """K-split flash-decode attention for short-query steps (decode + MTP).
+
+    Replaces both the context prefill kernel and the paged decode kernel:
+    the new tokens are already in the paged KV cache, so attention over
+    the full cached sequence covers them. Each query token becomes its
+    own sub-query (batch' = batch * Lq) with an extended seq_len, so the
+    standard q_len=1 K-split flash-decode kernel covers up to Lq query
+    tokens per request (MTP verification) without kernel changes.
+
+    Why: the single-pass context/paged kernels assign the full context
+    to 4-24 thread blocks (batch x kv heads), leaving ~50 of 52 CUs
+    idle; at 100k context that costs ~100 ms/layer (0.12% of the KV
+    bandwidth roofline). Flash decode splits the context across CUs and
+    reads it at roofline speed (1.14 ms/layer at 100k).
+
+    Returns True if the fast path was taken (output is written), False if
+    the caller must run its standard implementation.
+    """
+    if output_scale is not None:
+        # no fused output quantization in the flash-decode path
+        return False
+    if not causal:
+        return False
+    if alibi_slopes is not None or sinks is not None:
+        return False
+    if sliding_window and sliding_window > 0:
+        return False
+    if max_query_len < 1 or max_query_len > _FLASH_DECODE_MAX_LQ:
+        return False
+    if query.dtype not in (torch.half, torch.bfloat16):
+        return False
+    num_query_heads = query.shape[1]
+    head_size = query.shape[2]
+    if head_size > 256:
+        return False
+    real_block_size = value_cache.shape[3]
+    if real_block_size < 2 or (real_block_size & (real_block_size - 1)) != 0:
+        return False
+    if not has_native_kv_cache_layout(key_cache, value_cache):
+        return False
+    num_seqs = len(seq_lens)
+    num_tokens = query.shape[0]
+    # Uniform query length across requests (shape math only, no sync).
+    if num_seqs == 0 or num_tokens != num_seqs * max_query_len:
+        return False
+
+    lq = max_query_len
+    batch = num_seqs
+    n_sub = batch * lq
+
+    # fp8 KV view (the kernel reads the element dtype)
+    k_buf = key_cache
+    v_buf = value_cache
+    if "fp8" in kv_cache_dtype:
+        if kv_cache_dtype in ("fp8", "fp8_e4m3"):
+            t = current_platform.fp8_dtype()
+        else:
+            t = torch.float8_e5m2
+        k_buf = k_buf.view(t)
+        v_buf = v_buf.view(t)
+
+    # Sub-query b' = r*lq + i (request-major, lq innermost):
+    #  - q[b']      = query[b'] (contiguous, no copy)
+    #  - kv table   = block_table[r]
+    #  - seq_len    = seq_lens[r] - lq + i + 1
+    #    (seq_lens includes the new tokens; query token i of request r
+    #     sits at KV offset seq_lens[r] - lq + i and causally attends to
+    #     everything up to and including itself. For lq == 1 this is
+    #     exactly the standard decode seq_len.)
+    sub_seq = (
+        seq_lens.to(torch.int32).repeat_interleave(lq)
+        - lq
+        + 1
+        + torch.arange(n_sub, device=seq_lens.device, dtype=torch.int32) % lq
+    )
+    if is_block_table_ptr:
+        kv_element_size = key_cache.element_size()
+        block_byte_stride = key_cache.stride(0) * kv_element_size
+        bt = ((block_table - key_cache.data_ptr()) // block_byte_stride).to(
+            torch.int32
+        )
+    else:
+        bt = block_table.to(torch.int32)
+    bt = bt.repeat_interleave(lq, dim=0)
+
+    # K-split count: 4 kv heads x splits ~ fill the 52 CUs
+    splits = min(
+        _FLASH_DECODE_MAX_SPLITS, max(1, (max_seq_len + _FLASH_DECODE_SPLIT_LEN - 1)
+                                       // _FLASH_DECODE_SPLIT_LEN)
+    )
+
+    o = output.view(n_sub, num_query_heads, head_size)
+    lse = torch.empty(n_sub, num_query_heads, device=query.device,
+                      dtype=torch.float32)
+    mid = torch.empty(n_sub, num_query_heads, splits, head_size + 1,
+                      device=query.device, dtype=torch.float32)
+    decode_attention_fwd_grouped(
+        q=query,
+        k_buffer=k_buf,
+        v_buffer=v_buf,
+        o=o,
+        lse=lse,
+        req_to_token=bt,
+        b_seq_len=sub_seq,
+        attn_logits=mid,
+        num_kv_splits=splits,
+        sm_scale=sm_scale,
+        page_size=real_block_size,
+        logit_cap=0.0,
+        k_scale=(torch.tensor(1.0, device=query.device)
+                 if k_scale is None else k_scale),
+        v_scale=(torch.tensor(1.0, device=query.device)
+                 if v_scale is None else v_scale),
+    )
+    return True
+
+
 def chunked_prefill_paged_decode(
     query,
     key,
@@ -313,6 +460,28 @@ def chunked_prefill_paged_decode(
 
     if sliding_window is None or sliding_window <= 0:
         sliding_window = 0
+
+    if _try_flash_decode(
+        query=query,
+        output=output,
+        kv_cache_dtype=kv_cache_dtype,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table,
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
+        max_query_len=max_query_len,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        sm_scale=sm_scale,
+        alibi_slopes=alibi_slopes,
+        sliding_window=sliding_window,
+        sinks=sinks,
+        is_block_table_ptr=is_block_table_ptr,
+        causal=causal,
+        output_scale=output_scale,
+    ):
+        return output
 
     if max_query_len > 1:
         context_attention_fwd(
