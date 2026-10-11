@@ -19,6 +19,13 @@ from .triton_decode_attention import decode_attention_fwd_grouped
 
 logger = init_logger(__name__)
 
+
+class _GateCounter:
+    calls = 0
+
+
+_FLASH_DEBUG_LOGGER = _GateCounter()
+
 # K-split flash-decode tuning for gfx1100 (W7800: 52 CUs). Measured on
 # 2026-10-11 (docs/vllm-fork.md, containers repo): 100k-context fp8 KV
 # read in 1.14 ms with 52 splits (4 kv heads x 13) vs 106.7 ms for the
@@ -330,6 +337,25 @@ def _try_flash_decode(
     Returns True if the fast path was taken (output is written), False if
     the caller must run its standard implementation.
     """
+    # One-shot gate diagnostics (removed once the real-serving path is
+    # confirmed; first 3 calls only).
+    if _FLASH_DEBUG_LOGGER.calls < 3:
+        _FLASH_DEBUG_LOGGER.calls += 1
+        logger.info(
+            "[flash-decode gate] call #%d: num_tokens=%s "
+            "q_shape=%s q_dev=%s seq_dev=%s max_query_len=%s "
+            "seq_lens=%s dtype=%s kv_dtype=%s block_size=%s native=%s "
+            "heads=%s head_size=%s causal=%s alibi=%s sinks=%s "
+            "sliding=%s out_scale=%s",
+            _FLASH_DEBUG_LOGGER.calls,
+            query.shape[0], tuple(query.shape), query.device,
+            seq_lens.device, max_query_len, seq_lens.tolist(),
+            query.dtype, kv_cache_dtype,
+            value_cache.shape[3],
+            has_native_kv_cache_layout(key_cache, value_cache),
+            query.shape[1], query.shape[2], causal, alibi_slopes is not None,
+            sinks is not None, sliding_window, output_scale is not None,
+        )
     if output_scale is not None:
         # no fused output quantization in the flash-decode path
         return False
