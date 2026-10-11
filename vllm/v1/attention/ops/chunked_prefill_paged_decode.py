@@ -522,6 +522,97 @@ def chunked_prefill_paged_decode(
     ):
         return output
 
+    if _try_mixed_decode_prefill_split(
+        query=query,
+        key=key,
+        value=value,
+        output=output,
+        kv_cache_dtype=kv_cache_dtype,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table,
+        query_start_loc=query_start_loc,
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
+        max_query_len=max_query_len,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        alibi_slopes=alibi_slopes,
+        sliding_window=sliding_window,
+        sm_scale=sm_scale,
+        sinks=sinks,
+        is_block_table_ptr=is_block_table_ptr,
+        causal=causal,
+        output_scale=output_scale,
+    ):
+        return output
+
+    _standard_context_decode_path(
+        query=query,
+        key=key,
+        value=value,
+        output=output,
+        kv_cache_dtype=kv_cache_dtype,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table,
+        query_start_loc=query_start_loc,
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
+        max_query_len=max_query_len,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        alibi_slopes=alibi_slopes,
+        sliding_window=sliding_window,
+        sm_scale=sm_scale,
+        sinks=sinks,
+        is_block_table_ptr=is_block_table_ptr,
+        causal=causal,
+        output_scale=output_scale,
+    )
+    return output
+
+
+
+
+def _standard_context_decode_path(
+    query,
+    key,
+    value,
+    output,
+    kv_cache_dtype,
+    key_cache,
+    value_cache,
+    block_table,
+    query_start_loc,
+    seq_lens,
+    max_seq_len,
+    max_query_len,
+    k_scale,
+    v_scale,
+    alibi_slopes=None,
+    sliding_window=None,
+    sm_scale=None,
+    output_scale=None,
+    sinks=None,
+    is_block_table_ptr: bool = False,
+    causal: bool = True,
+):
+    """The standard (pre-A') implementation, extracted so a request
+    subset can run it in isolation (see _try_mixed_decode_prefill_split).
+
+    Row partitioning is exclusive: the context kernel handles the cached
+    prefix of requests with query_len > 1 (skip_decode=True), the paged
+    2D kernel handles the full KV of requests with query_len == 1
+    (filter_by_query_len=True). No row is written twice, so a subset's
+    q/k/v/output slices can be computed independently.
+    """
+    if sm_scale is None:
+        sm_scale = 1.0 / (query.shape[2] ** 0.5)
+    if sliding_window is None or sliding_window <= 0:
+        sliding_window = 0
+    use_alibi_slopes = alibi_slopes is not None
+
     if max_query_len > 1:
         context_attention_fwd(
             q=query,
@@ -713,3 +804,205 @@ def chunked_prefill_paged_decode(
             USE_SINKS=sinks is not None,
             USE_FP8=output_scale is not None,
         )
+
+
+
+
+def _try_mixed_decode_prefill_split(
+    query,
+    key,
+    value,
+    output,
+    kv_cache_dtype,
+    key_cache,
+    value_cache,
+    block_table,
+    query_start_loc,
+    seq_lens,
+    max_seq_len,
+    max_query_len,
+    k_scale,
+    v_scale,
+    alibi_slopes,
+    sliding_window,
+    sm_scale,
+    sinks,
+    is_block_table_ptr,
+    causal,
+    output_scale,
+) -> bool:
+    """A-prime-prime-prime: split a batch that mixes short-query rows
+    (decode / MTP verify, qlen <= 8) with long-query rows (prefill
+    chunks, qlen > 8).
+
+    Stock behavior: the batch-wide max_query_len trips the flash-decode
+    gate, so the whole batch runs the standard context kernel -- and
+    the decode requests with long cached contexts ride at cliff speed
+    (~0.5 t/s measured) for the duration of the prefill step.
+
+    Here: each uniform-qlen decode group runs the K-split flash-decode
+    path (A'/A''); the prefill requests run the stock standard path on
+    their own slice with a rebased query_start_loc. Together they cover
+    every row exactly once.
+
+    Cost: one small GPU->CPU sync (query_start_loc.tolist()) plus small
+    row copies, paid only on the mixed step (a rare, already
+    cliff-bound event). The v1 attention op runs eager (outside
+    piecewise cudagraphs), so the sync is safe.
+
+    Returns True if the split handled the batch (output fully written),
+    False if the caller must run the standard path for the whole batch.
+    """
+    # --- common shape gate: identical to _try_flash_decode's ---
+    if max_query_len <= _FLASH_DECODE_MAX_LQ:
+        # Pure decode/verify batch: uniform -> _try_flash_decode (the
+        # caller) already took it; non-uniform -> the standard path,
+        # as in stock. Bailing out here keeps the per-step D2H sync
+        # (query_start_loc.tolist() below) off the hot decode path.
+        return False
+    if output_scale is not None:
+        return False
+    if not causal:
+        return False
+    if alibi_slopes is not None or sinks is not None:
+        return False
+    if sliding_window and sliding_window > 0:
+        return False
+    if query.dtype not in (torch.half, torch.bfloat16):
+        return False
+    head_size = query.shape[2]
+    if head_size > 256:
+        return False
+    if key_cache.ndim != 5 or value_cache.ndim != 4:
+        return False
+    real_block_size = value_cache.shape[3]
+    if real_block_size < 2 or key_cache.shape[3] != real_block_size:
+        return False
+    if key_cache.shape[1] != value_cache.shape[1]:
+        return False
+    if key_cache.shape[2] * key_cache.shape[4] != head_size:
+        return False
+    if value_cache.shape[2] != head_size:
+        return False
+
+    # --- per-request query lengths (the one D2H sync of this path) ---
+    qlens = query_start_loc.tolist()  # (num_seqs + 1,) cumulated
+    num_seqs = len(qlens) - 1
+    num_tokens = query.shape[0]
+    if num_seqs == 0 or qlens[-1] != num_tokens:
+        return False
+    qlens_per_req = [qlens[i + 1] - qlens[i] for i in range(num_seqs)]
+    decode_reqs = [
+        i for i, l in enumerate(qlens_per_req)
+        if 1 <= l <= _FLASH_DECODE_MAX_LQ
+    ]
+    prefill_reqs = [
+        i for i, l in enumerate(qlens_per_req)
+        if l > _FLASH_DECODE_MAX_LQ
+    ]
+    if not decode_reqs:
+        return False
+    # Split only when the standard path would slow down the decode rows:
+    # a prefill request coexists, or the decode batch is non-uniform in
+    # qlen (mixed MTP phases, e.g. lq=1 next to lq=4).
+    decode_groups = {}
+    for r in decode_reqs:
+        decode_groups.setdefault(qlens_per_req[r], []).append(r)
+    if not prefill_reqs and len(decode_groups) < 2:
+        return False
+
+    dev = query.device
+
+    # --- decode groups: flash-decode path (uniform qlen per group) ---
+    # NOTE: query/output are indexed by token rows; block_table/seq_lens
+    # by REQUEST index. Two distinct index tensors -- mixing them is an
+    # OOB (request idx > num_seqs faults the GPU on gfx1100).
+    for lq in sorted(decode_groups):
+        reqs = decode_groups[lq]
+        rows = [qlens[i] + j for i in reqs for j in range(qlens_per_req[i])]
+        idx = torch.tensor(rows, dtype=torch.int64, device=dev)
+        idx_reqs = torch.tensor(reqs, dtype=torch.int64, device=dev)
+        qg = query.index_select(0, idx).contiguous()
+        og = torch.empty_like(qg)
+        btg = block_table.index_select(0, idx_reqs).contiguous()
+        slg = seq_lens.index_select(0, idx_reqs).contiguous()
+        ok = _try_flash_decode(
+            query=qg,
+            output=og,
+            kv_cache_dtype=kv_cache_dtype,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=btg,
+            seq_lens=slg,
+            max_seq_len=max_seq_len,
+            max_query_len=lq,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            sm_scale=sm_scale,
+            alibi_slopes=alibi_slopes,
+            sliding_window=sliding_window,
+            sinks=sinks,
+            is_block_table_ptr=is_block_table_ptr,
+            causal=causal,
+            output_scale=output_scale,
+        )
+        if not ok:
+            # Cannot happen by construction (uniform group + common
+            # gate); fail loud rather than leave the row unwritten.
+            raise RuntimeError(
+                "A''' split: flash gate rejected a uniform decode group "
+                f"(lq={lq}); partial output state"
+            )
+        output[idx] = og
+
+    # --- prefill subset: stock standard path on its own slice ---
+    if prefill_reqs:
+        rows_p = [
+            qlens[i] + j for i in prefill_reqs
+            for j in range(qlens_per_req[i])
+        ]
+        idx_p = torch.tensor(rows_p, dtype=torch.int64, device=dev)
+        idx_reqs_p = torch.tensor(prefill_reqs, dtype=torch.int64, device=dev)
+        qp = query.index_select(0, idx_p).contiguous()
+        op = output.index_select(0, idx_p).contiguous()
+        btp = block_table.index_select(0, idx_reqs_p).contiguous()
+        slp = seq_lens.index_select(0, idx_reqs_p).contiguous()
+        # Rebased query_start_loc (cumulated within the subset): the
+        # standard kernels index per-request rows through it.
+        qslp = [0]
+        for i in prefill_reqs:
+            qslp.append(qslp[-1] + qlens_per_req[i])
+        qslp_t = torch.tensor(
+            qslp, dtype=query_start_loc.dtype, device=dev
+        )
+        kp = (key.index_select(0, idx_p).contiguous()
+              if key is not None else None)
+        vp = (value.index_select(0, idx_p).contiguous()
+              if value is not None else None)
+        max_q_pre = max(qlens_per_req[i] for i in prefill_reqs)
+        _standard_context_decode_path(
+            query=qp,
+            key=kp,
+            value=vp,
+            output=op,
+            kv_cache_dtype=kv_cache_dtype,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=btp,
+            query_start_loc=qslp_t,
+            seq_lens=slp,
+            max_seq_len=max_seq_len,
+            max_query_len=max_q_pre,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            alibi_slopes=alibi_slopes,
+            sliding_window=sliding_window,
+            sm_scale=sm_scale,
+            output_scale=output_scale,
+            sinks=sinks,
+            is_block_table_ptr=is_block_table_ptr,
+            causal=causal,
+        )
+        output[idx_p] = op
+
+    return True
