@@ -490,6 +490,271 @@ def _fwd_grouped_kernel_stage1(
         )
 
 
+@triton.jit
+def _fwd_grouped_kernel_stage1_multiq(
+    Q,
+    K_Buffer,
+    V_Buffer,
+    sm_scale,
+    Req_to_tokens,
+    B_Seqlen,
+    Att_Out,
+    stride_req_to_tokens_b,
+    stride_qbs,
+    stride_qh,
+    stride_buf_k0,
+    stride_buf_k1,
+    stride_buf_k2,
+    stride_buf_k3,
+    stride_buf_k4,
+    stride_buf_v0,
+    stride_buf_v1,
+    stride_buf_v2,
+    stride_buf_v3,
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
+    k_scale,
+    v_scale,
+    LQ: tl.constexpr,          # uniform sub-query length per request
+    H_PAD: tl.constexpr,       # next_pow2(KV_GROUP)
+    KV_GROUP: tl.constexpr,    # query heads per kv head
+    ROWS: tl.constexpr,        # next_pow2(LQ * H_PAD)
+    q_head_num: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    Lk: tl.constexpr,
+    Lv: tl.constexpr,
+    x_pack: tl.constexpr,
+):
+    # Multi-sub-query stage1: one program handles ALL LQ sub-queries of one
+    # request for one kv-head group, streaming the shared KV exactly once.
+    # Q rows are (sub-query i, head h) with row = i * H_PAD + h; the causal
+    # length of row i is ctx + i + 1 where ctx = seq_len - LQ (the LQ new
+    # tokens live at the tail of the paged cache; sub-query i sees the first
+    # i of them plus itself).
+    cur_batch = tl.program_id(0)  # request index (NOT sub-query)
+    cur_head_id = tl.program_id(1)
+    cur_kv_head = cur_head_id
+    split_kv_id = tl.program_id(2)
+
+    row = tl.arange(0, ROWS)
+    i = row // H_PAD
+    h_local = row % H_PAD
+    head = cur_head_id * KV_GROUP + h_local
+    row_valid = (i < LQ) & (h_local < KV_GROUP) & (head < q_head_num)
+    subq = cur_batch * LQ + i
+
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    mask_d = offs_d < Lk
+    mask_dv = offs_dv < Lv
+
+    offs_q = subq[:, None] * stride_qbs + head[:, None] * stride_qh + offs_d[None, :]
+    q = tl.load(
+        Q + offs_q,
+        mask=row_valid[:, None] & mask_d[None, :],
+        other=0.0,
+        cache_modifier=".ca",
+    )
+
+    cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
+    ctx_len = cur_batch_seq_len - LQ  # context tokens before the LQ group
+    row_len = ctx_len + i + 1  # causal key count per sub-query row
+
+    kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
+    split_kv_start = kv_len_per_split * split_kv_id
+    split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+
+    e_max = tl.zeros([ROWS], dtype=tl.float32) - float("inf")
+    e_sum = tl.zeros([ROWS], dtype=tl.float32)
+    acc = tl.zeros([ROWS, BLOCK_DV], dtype=tl.float32)
+
+    if split_kv_end > split_kv_start:
+        # Real ROCm paged KV layout (strided, token innermost), shared
+        # across all LQ sub-query rows of this request:
+        #   K: (num_blocks, num_kv_heads, head_dim / x_pack, PAGE_SIZE, x_pack)
+        #   V: (num_blocks, num_kv_heads, head_dim, PAGE_SIZE)
+        base_offs_k = cur_kv_head * stride_buf_k1
+        base_offs_v = cur_kv_head * stride_buf_v1
+
+        ks = tl.load(k_scale)
+        vs = tl.load(v_scale)
+        for start_n in tl.range(split_kv_start, split_kv_end, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            kv_page_number = tl.load(
+                Req_to_tokens
+                + stride_req_to_tokens_b * cur_batch
+                + offs_n // PAGE_SIZE,
+                mask=offs_n < split_kv_end,
+                other=0,
+                cache_modifier=".ca",
+            ).to(tl.int64)  # page_number * page stride overflows int32
+            kv_in_page = offs_n % PAGE_SIZE
+            kv_off_k = kv_page_number * stride_buf_k0 + kv_in_page * stride_buf_k3
+
+            offs_buf_k = (
+                kv_off_k[None, :]
+                + base_offs_k
+                + (offs_d[:, None] // x_pack) * stride_buf_k2
+                + (offs_d[:, None] % x_pack) * stride_buf_k4
+            )
+            k = tl.load(
+                K_Buffer + offs_buf_k,
+                mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
+                other=0.0,
+                cache_modifier=".cg",
+            )
+            if k.dtype.is_fp8():
+                k = (k.to(tl.float32) * ks).to(q.dtype)
+            qk = tl.dot(q, k.to(q.dtype)) * sm_scale
+
+            # Causal mask: row i sees keys < ctx_len + i + 1 (the LQ new
+            # tokens are the last LQ keys of the paged cache; sub-query i
+            # sees the first i of them plus itself). The per-row compare
+            # is one (ROWS, BLOCK_N) vector op per tile -- negligible
+            # next to the KV dots.
+            col_mask = ((offs_n[None, :] < row_len[:, None])
+                        & (offs_n[None, :] < split_kv_end))
+            qk = tl.where(row_valid[:, None] & col_mask, qk, float("-inf"))
+
+            kv_off_v = kv_page_number * stride_buf_v0 + kv_in_page * stride_buf_v3
+            offs_buf_v = (
+                kv_off_v[None, :]
+                + base_offs_v
+                + offs_dv[:, None] * stride_buf_v2
+            )
+            vT = tl.load(
+                V_Buffer + offs_buf_v,
+                mask=(offs_n[None, :] < split_kv_end) & (mask_dv[:, None]),
+                other=0.0,
+            )
+            if vT.dtype.is_fp8():
+                vT = (vT.to(tl.float32) * vs).to(q.dtype)
+            v = tl.trans(vT)
+
+            n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+            # Rows with no visible key in this split keep n_e_max == -inf:
+            # re_scale must be 1 (no-op, not exp(-inf - -inf) = NaN) and
+            # p must be 0, or the running acc/e_sum corrupt to NaN and the
+            # stage2 merge picks it up (weight 0 x NaN = NaN).
+            re_scale = tl.where(
+                n_e_max == float("-inf"), 1.0, tl.exp(e_max - n_e_max)
+            )
+            p = tl.exp(qk - n_e_max[:, None])
+            p = tl.where(qk == float("-inf"), 0.0, p)
+            acc *= re_scale[:, None]
+            acc += tl.dot(p.to(v.dtype), v)
+
+            e_sum = e_sum * re_scale + tl.sum(p, 1)
+            e_max = n_e_max
+
+    # Rows with no visible key in this split (split_start >= row_len):
+    # e_sum == 0 -> store a finite zero o and lse = -inf so the stage2
+    # logsumexp merge weights the split exactly 0.
+    safe_sum = tl.where(e_sum > 0.0, e_sum, 1.0)
+    offs_mid_o = (
+        subq[:, None] * stride_mid_ob
+        + head[:, None] * stride_mid_oh
+        + split_kv_id * stride_mid_os
+        + offs_dv[None, :]
+    )
+
+    tl.store(
+        Att_Out + offs_mid_o,
+        acc / safe_sum[:, None],
+        mask=row_valid[:, None] & mask_dv[None, :],
+    )
+
+    lse_val = tl.where(e_sum > 0.0, e_max + tl.log(e_sum), float("-inf"))
+    offs_mid_o_1 = (
+        subq * stride_mid_ob
+        + head * stride_mid_oh
+        + split_kv_id * stride_mid_os
+        + Lv
+    )
+
+    tl.store(Att_Out + offs_mid_o_1, lse_val, mask=row_valid)
+
+
+@triton.jit
+def _fwd_kernel_stage2_multiq(
+    Mid_O,
+    o,
+    lse,
+    B_Seqlen,
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
+    stride_obs,
+    stride_oh,
+    stride_lse_bs,
+    NUM_KV_SPLITS: tl.constexpr,
+    LQ: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    Lv: tl.constexpr,
+    OUTPUT_FP16: tl.constexpr = 0,
+):
+    # Stage2 for the multiq stage1: same logsumexp merge, but the split
+    # boundaries are derived from the REQUEST seq len (stage1 multiq splits
+    # per request), so B_Seqlen is request-indexed while the grid is
+    # sub-query-indexed: request = cur_batch // LQ.
+    cur_batch = tl.program_id(0)
+    cur_head = tl.program_id(1)
+
+    cur_batch_seq_len = tl.load(B_Seqlen + cur_batch // LQ)
+
+    offs_d = tl.arange(0, BLOCK_DV)
+    mask_d = offs_d < Lv
+
+    e_sum = 0.0
+    e_max = -float("inf")
+    acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
+
+    offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d
+    offs_logic = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + Lv
+
+    for split_kv_id in range(0, NUM_KV_SPLITS):
+        kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
+        split_kv_start = kv_len_per_split * split_kv_id
+        split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+
+        if split_kv_end > split_kv_start:
+            tv = tl.load(
+                Mid_O + offs_v + split_kv_id * stride_mid_os, mask=mask_d, other=0.0
+            )
+            tlogic = tl.load(Mid_O + offs_logic + split_kv_id * stride_mid_os)
+            n_e_max = tl.maximum(tlogic, e_max)
+
+            # avoid inf - inf = nan in the exp below for fully-masked splits
+            tlogic_safe = tl.where(tlogic == -float("inf"), -1e30, tlogic)
+            e_max_safe = tl.where(e_max == -float("inf"), -1e30, e_max)
+            scale = tl.exp(e_max_safe - n_e_max)
+            p = tl.exp(tlogic_safe - n_e_max)
+
+            acc *= scale
+            acc += tv * p
+
+            e_sum = e_sum * scale + p
+            e_max = n_e_max
+
+    result = acc / e_sum
+
+    if OUTPUT_FP16:
+        result = result.to(tl.float16)
+
+    tl.store(
+        o + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
+        result,
+        mask=mask_d,
+    )
+
+    tl.store(lse + cur_batch * stride_lse_bs + cur_head, e_max + tl.log(e_sum))
+
+
 def _decode_grouped_att_m_fwd(
     q,
     k_buffer,
@@ -620,6 +885,124 @@ def _decode_grouped_att_m_fwd(
         Lv=Lv,
         x_pack=x_pack,
         IS_MLA=is_mla,
+        **extra_kargs,
+    )
+
+
+def _decode_grouped_att_m_fwd_multiq(
+    q,
+    k_buffer,
+    v_buffer,
+    att_out,
+    Req_to_tokens,
+    B_Seqlen,
+    num_kv_splits,
+    sm_scale,
+    page_size,
+    lq,
+    k_scale,
+    v_scale,
+):
+    # Multi-sub-query stage1 launcher.
+    #   q: (batch * lq, Hq, D) -- lq uniform per request, request-major
+    #   B_Seqlen: (batch,) -- FULL request seq len (incl. the lq new tokens)
+    #   att_out: (batch * lq, Hq, splits, D + 1) -- mid, per sub-query row
+    # Layout contract: same as _decode_grouped_att_m_fwd (real ROCm 5D K /
+    # 4D V token-innermost, or legacy (..., PAGE, H, D)).
+    if k_buffer.ndim == 5:
+        Lk = k_buffer.shape[2] * k_buffer.shape[4]
+        Lv = v_buffer.shape[2]
+        x_pack = k_buffer.shape[-1]
+        kv_group_num = q.shape[1] // k_buffer.shape[1]
+        k_strides = k_buffer.stride()
+        v_strides = v_buffer.stride()
+    else:
+        Lk = k_buffer.shape[-1]
+        Lv = v_buffer.shape[-1]
+        x_pack = 1
+        kv_group_num = q.shape[1] // k_buffer.shape[-2]
+        k_strides = (
+            _page_stride(k_buffer, page_size),
+            k_buffer.stride(-2),
+            1,
+            k_buffer.stride(-3),
+            0,
+        )
+        v_strides = (
+            _page_stride(v_buffer, page_size),
+            v_buffer.stride(-2),
+            1,
+            v_buffer.stride(-3),
+        )
+
+    BLOCK_DMODEL = triton.next_power_of_2(Lk)
+    BLOCK_DV = triton.next_power_of_2(Lv)
+    BLOCK = 16
+    if not is_hip_:
+        BLOCK = 32
+
+    H_PAD = max(triton.next_power_of_2(kv_group_num), 1)
+    ROWS = max(16, triton.next_power_of_2(lq * H_PAD))
+
+    batch = q.shape[0] // lq
+    head_num = q.shape[1]
+
+    grid = (
+        batch,
+        triton.cdiv(head_num, kv_group_num),
+        num_kv_splits,
+    )
+
+    extra_kargs = {}
+    num_stages = 1
+    if is_hip_:
+        # same tuning as _decode_grouped_att_m_fwd
+        extra_kargs = {
+            "waves_per_eu": 1,
+            "matrix_instr_nonkdim": 16,
+            "kpack": 2,
+        }
+
+    _fwd_grouped_kernel_stage1_multiq[grid](
+        q,
+        k_buffer,
+        v_buffer,
+        sm_scale,
+        Req_to_tokens,
+        B_Seqlen,
+        att_out,
+        Req_to_tokens.stride(0),
+        q.stride(0),
+        q.stride(1),
+        k_strides[0],
+        k_strides[1],
+        k_strides[2],
+        k_strides[3],
+        k_strides[4],
+        v_strides[0],
+        v_strides[1],
+        v_strides[2],
+        v_strides[3],
+        att_out.stride(0),
+        att_out.stride(1),
+        att_out.stride(2),
+        k_scale,
+        v_scale,
+        LQ=lq,
+        H_PAD=H_PAD,
+        KV_GROUP=kv_group_num,
+        ROWS=ROWS,
+        q_head_num=head_num,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_DV=BLOCK_DV,
+        BLOCK_N=BLOCK,
+        NUM_KV_SPLITS=num_kv_splits,
+        PAGE_SIZE=page_size,
+        Lk=Lk,
+        Lv=Lv,
+        x_pack=x_pack,
+        num_warps=4,
+        num_stages=num_stages,
         **extra_kargs,
     )
 
@@ -788,6 +1171,10 @@ def decode_attention_fwd_grouped(
     v_scale=None,
     is_mla=False,
 ):
+    if k_scale is None:
+        k_scale = torch.tensor(1.0, dtype=torch.float32, device=q.device)
+    if v_scale is None:
+        v_scale = torch.tensor(1.0, dtype=torch.float32, device=q.device)
     _decode_grouped_att_m_fwd(
         q,
         k_buffer,
@@ -805,6 +1192,103 @@ def decode_attention_fwd_grouped(
     )
     _decode_softmax_reducev_fwd(
         attn_logits, q, o, lse, v_buffer, b_seq_len, num_kv_splits
+    )
+
+
+def _decode_softmax_reducev_fwd_multiq(
+    logits,
+    q,
+    o,
+    lse,
+    b_seq_len,
+    num_kv_splits,
+    lq,
+):
+    # Stage2 launcher for the multiq stage1: grid is sub-query-indexed
+    # (q.shape[0] = batch * lq) while b_seq_len is request-indexed; the
+    # kernel recovers the request as cur_batch // lq so the split
+    # boundaries match stage1's request-level split scheme.
+    batch, head_num = q.shape[0], q.shape[1]
+    Lv = q.shape[2]
+    BLOCK_DV = triton.next_power_of_2(Lv)
+
+    extra_kargs = {}
+    if is_hip_:
+        extra_kargs = {
+            "waves_per_eu": 4,
+            "matrix_instr_nonkdim": 16,
+            "kpack": 2,
+        }
+
+    grid = (batch, head_num)
+    _fwd_kernel_stage2_multiq[grid](
+        logits,
+        o,
+        lse,
+        b_seq_len,
+        logits.stride(0),
+        logits.stride(1),
+        logits.stride(2),
+        o.stride(0),
+        o.stride(1),
+        lse.stride(0),
+        NUM_KV_SPLITS=num_kv_splits,
+        LQ=lq,
+        BLOCK_DV=BLOCK_DV,
+        Lv=Lv,
+        num_warps=4,
+        num_stages=2,
+        **extra_kargs,
+    )
+
+
+def decode_attention_fwd_grouped_multiq(
+    q,
+    k_buffer,
+    v_buffer,
+    o,
+    lse,
+    req_to_token,
+    b_seq_len,
+    attn_logits,
+    num_kv_splits,
+    sm_scale,
+    page_size,
+    lq,
+    k_scale=None,
+    v_scale=None,
+):
+    """Multi-sub-query K-split flash decode (one KV pass per request).
+
+    For a uniform-lq decode/verify batch (q: (batch*lq, Hq, D)), each
+    request's lq sub-queries share the KV stream in stage1, cutting the
+    KV traffic vs the per-sub-query path by ~lq at long context. b_seq_len
+    is per-REQUEST (full seq len incl. the lq new tokens).
+    """
+    assert q.shape[0] % lq == 0
+    assert 2 <= lq <= 8, 'lq==1 should use decode_attention_fwd_grouped'
+
+    if k_scale is None:
+        k_scale = torch.tensor(1.0, dtype=torch.float32, device=q.device)
+    if v_scale is None:
+        v_scale = torch.tensor(1.0, dtype=torch.float32, device=q.device)
+
+    _decode_grouped_att_m_fwd_multiq(
+        q,
+        k_buffer,
+        v_buffer,
+        attn_logits,
+        req_to_token,
+        b_seq_len,
+        num_kv_splits,
+        sm_scale,
+        page_size,
+        lq,
+        k_scale,
+        v_scale,
+    )
+    _decode_softmax_reducev_fwd_multiq(
+        attn_logits, q, o, lse, b_seq_len, num_kv_splits, lq
     )
 
 

@@ -15,7 +15,10 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .prefix_prefill import context_attention_fwd
-from .triton_decode_attention import decode_attention_fwd_grouped
+from .triton_decode_attention import (
+    decode_attention_fwd_grouped,
+    decode_attention_fwd_grouped_multiq,
+)
 
 logger = init_logger(__name__)
 
@@ -387,20 +390,15 @@ def _try_flash_decode(
         k_buf = k_buf.view(t)
         v_buf = v_buf.view(t)
 
-    # Sub-query b' = r*lq + i (request-major, lq innermost):
-    #  - q[b']      = query[b'] (contiguous, no copy)
-    #  - kv table   = block_table[r]
-    #  - seq_len    = seq_lens[r] - lq + i + 1
-    #    (seq_lens includes the new tokens; query token i of request r
-    #     sits at KV offset seq_lens[r] - lq + i and causally attends to
-    #     everything up to and including itself. For lq == 1 this is
-    #     exactly the standard decode seq_len.)
-    sub_seq = (
-        seq_lens.to(torch.int32).repeat_interleave(lq)
-        - lq
-        + 1
-        + torch.arange(n_sub, device=seq_lens.device, dtype=torch.int32) % lq
-    )
+    # Query rows are already request-major: row b' = r*lq + i. For
+    # lq == 1 the sub-query batch IS the request batch (identity);
+    # for lq >= 2 the multiq stage1 consumes the UNEXPANDED q
+    # (n_sub = batch*lq rows) plus the request-level block table and
+    # seq lens and streams each request's KV once for all its lq
+    # sub-queries (~lq less KV traffic at long context). Query token i
+    # of request r sits at KV offset seq_lens[r] - lq + i and causally
+    # attends to everything up to and including itself (seq_lens
+    # includes the new tokens, which are already in the paged cache).
     if is_block_table_ptr:
         kv_element_size = key_cache.element_size()
         block_byte_stride = key_cache.stride(0) * kv_element_size
@@ -409,7 +407,7 @@ def _try_flash_decode(
         )
     else:
         bt = block_table.to(torch.int32)
-    bt = bt.repeat_interleave(lq, dim=0)
+    seq_i32 = seq_lens.to(torch.int32)
 
     # K-split count: 4 kv heads x splits ~ fill the 52 CUs
     splits = min(
@@ -420,26 +418,53 @@ def _try_flash_decode(
     o = output.view(n_sub, num_query_heads, head_size)
     lse = torch.empty(n_sub, num_query_heads, device=query.device,
                       dtype=torch.float32)
+    # mid is indexed (sub-query row, head, split); the stage1 kernels
+    # skip the store for empty splits, so zero the buffer and mark the
+    # lse column -inf: the stage2 logsumexp merge then weights empty
+    # splits exactly 0 (an uninit read would corrupt the merge for
+    # short requests batched with long ones).
     mid = torch.empty(n_sub, num_query_heads, splits, head_size + 1,
                       device=query.device, dtype=torch.float32)
-    decode_attention_fwd_grouped(
-        q=query,
-        k_buffer=k_buf,
-        v_buffer=v_buf,
-        o=o,
-        lse=lse,
-        req_to_token=bt,
-        b_seq_len=sub_seq,
-        attn_logits=mid,
-        num_kv_splits=splits,
-        sm_scale=sm_scale,
-        page_size=real_block_size,
-        logit_cap=0.0,
-        k_scale=(torch.tensor(1.0, device=query.device)
-                 if k_scale is None else k_scale),
-        v_scale=(torch.tensor(1.0, device=query.device)
-                 if v_scale is None else v_scale),
-    )
+    mid.zero_()
+    mid[..., head_size] = float("-inf")
+    k_arg = (torch.tensor(1.0, device=query.device)
+             if k_scale is None else k_scale)
+    v_arg = (torch.tensor(1.0, device=query.device)
+             if v_scale is None else v_scale)
+    if lq == 1:
+        decode_attention_fwd_grouped(
+            q=query,
+            k_buffer=k_buf,
+            v_buffer=v_buf,
+            o=o,
+            lse=lse,
+            req_to_token=bt,
+            b_seq_len=seq_i32,
+            attn_logits=mid,
+            num_kv_splits=splits,
+            sm_scale=sm_scale,
+            page_size=real_block_size,
+            logit_cap=0.0,
+            k_scale=k_arg,
+            v_scale=v_arg,
+        )
+    else:
+        decode_attention_fwd_grouped_multiq(
+            q=query,
+            k_buffer=k_buf,
+            v_buffer=v_buf,
+            o=o,
+            lse=lse,
+            req_to_token=bt,
+            b_seq_len=seq_i32,
+            attn_logits=mid,
+            num_kv_splits=splits,
+            sm_scale=sm_scale,
+            page_size=real_block_size,
+            lq=lq,
+            k_scale=k_arg,
+            v_scale=v_arg,
+        )
     return True
 
 
