@@ -20,12 +20,6 @@ from .triton_decode_attention import decode_attention_fwd_grouped
 logger = init_logger(__name__)
 
 
-class _GateCounter:
-    calls = 0
-
-
-_FLASH_DEBUG_LOGGER = _GateCounter()
-
 # K-split flash-decode tuning for gfx1100 (W7800: 52 CUs). Measured on
 # 2026-10-11 (docs/vllm-fork.md, containers repo): 100k-context fp8 KV
 # read in 1.14 ms with 52 splits (4 kv heads x 13) vs 106.7 ms for the
@@ -428,15 +422,6 @@ def _try_flash_decode(
                       dtype=torch.float32)
     mid = torch.empty(n_sub, num_query_heads, splits, head_size + 1,
                       device=query.device, dtype=torch.float32)
-    if _FLASH_DEBUG_LOGGER.calls < 3:
-        _FLASH_DEBUG_LOGGER.calls += 1
-        logger.info(
-            "[flash-decode] call #%d ACCEPTED: lq=%s batch=%s seq_lens=%s "
-            "max_seq=%s PB=%s Hkv=%s heads=%s D=%s splits=%s",
-            _FLASH_DEBUG_LOGGER.calls, lq, batch, seq_lens.tolist(),
-            max_seq_len, real_block_size, key_cache.shape[1],
-            query.shape[1], head_size, splits,
-        )
     decode_attention_fwd_grouped(
         q=query,
         k_buffer=k_buf,
