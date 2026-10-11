@@ -287,12 +287,15 @@ def _fwd_grouped_kernel_stage1(
     stride_req_to_tokens_b,
     stride_qbs,
     stride_qh,
-    stride_buf_kpbs,
-    stride_buf_kbs,
-    stride_buf_kh,
-    stride_buf_vpbs,
-    stride_buf_vbs,
-    stride_buf_vh,
+    stride_buf_k0,
+    stride_buf_k1,
+    stride_buf_k2,
+    stride_buf_k3,
+    stride_buf_k4,
+    stride_buf_v0,
+    stride_buf_v1,
+    stride_buf_v2,
+    stride_buf_v3,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -310,6 +313,7 @@ def _fwd_grouped_kernel_stage1(
     logit_cap: tl.constexpr,
     Lk: tl.constexpr,
     Lv: tl.constexpr,
+    x_pack: tl.constexpr,
     IS_MLA: tl.constexpr = False,
 ):
     cur_batch = tl.program_id(0)
@@ -359,10 +363,18 @@ def _fwd_grouped_kernel_stage1(
     acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
 
     if split_kv_end > split_kv_start:
-        base_offs_k = cur_kv_head * stride_buf_kh + offs_d[:, None]
-        base_offs_v = cur_kv_head * stride_buf_vh + offs_dv[None, :]
+        # Real ROCm paged KV layout (strided, token innermost):
+        #   K: (num_blocks, num_kv_heads, head_dim / x_pack, PAGE_SIZE, x_pack)
+        #   V: (num_blocks, num_kv_heads, head_dim, PAGE_SIZE)
+        # V is loaded as a (head_dim, tokens) tile (tokens innermost, like
+        # K) and transposed for the dot: the token stride is 1, so each
+        # head-dim row is a vectorizable 16 B fp8 run; loading (tokens,
+        # head_dim) instead would scatter 1 B elements at the head-dim
+        # stride.
+        base_offs_k = cur_kv_head * stride_buf_k1
+        base_offs_v = cur_kv_head * stride_buf_v1
         if BLOCK_DPE > 0:
-            base_offs_kpe = cur_kv_head * stride_buf_kh + offs_dpe[:, None]
+            base_offs_kpe = cur_kv_head * stride_buf_k1
 
         ks = tl.load(k_scale)
         vs = tl.load(v_scale)
@@ -376,12 +388,16 @@ def _fwd_grouped_kernel_stage1(
                 other=0,
                 cache_modifier=".ca",
             ).to(tl.int64)  # page_number * page stride overflows int32
-            kv_off_k = (
-                kv_page_number * stride_buf_kpbs + (offs_n % PAGE_SIZE) * stride_buf_kbs
-            )
+            kv_in_page = offs_n % PAGE_SIZE
+            kv_off_k = kv_page_number * stride_buf_k0 + kv_in_page * stride_buf_k3
 
             # explicitly facilitate overlapping load/compute
-            offs_buf_k = kv_off_k[None, :] + base_offs_k
+            offs_buf_k = (
+                kv_off_k[None, :]
+                + base_offs_k
+                + (offs_d[:, None] // x_pack) * stride_buf_k2
+                + (offs_d[:, None] % x_pack) * stride_buf_k4
+            )
             k = tl.load(
                 K_Buffer + offs_buf_k,
                 mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
@@ -393,7 +409,12 @@ def _fwd_grouped_kernel_stage1(
                 k = (k.to(tl.float32) * ks).to(q.dtype)
             qk = tl.dot(q, k.to(q.dtype))
             if BLOCK_DPE > 0:
-                offs_buf_kpe = kv_off_k[None, :] + base_offs_kpe
+                offs_buf_kpe = (
+                    kv_off_k[None, :]
+                    + base_offs_kpe
+                    + (offs_dpe[:, None] // x_pack) * stride_buf_k2
+                    + (offs_dpe[:, None] % x_pack) * stride_buf_k4
+                )
                 kpe = tl.load(
                     K_Buffer + offs_buf_kpe,
                     mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
@@ -413,18 +434,20 @@ def _fwd_grouped_kernel_stage1(
             )
 
             if not IS_MLA:
-                kv_off_v = (
-                    kv_page_number * stride_buf_vpbs
-                    + (offs_n % PAGE_SIZE) * stride_buf_vbs
+                kv_off_v = kv_page_number * stride_buf_v0 + kv_in_page * stride_buf_v3
+                offs_buf_v = (
+                    kv_off_v[None, :]
+                    + base_offs_v
+                    + offs_dv[:, None] * stride_buf_v2
                 )
-                offs_buf_v = kv_off_v[:, None] + base_offs_v
-                v = tl.load(
+                vT = tl.load(
                     V_Buffer + offs_buf_v,
-                    mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                    mask=(offs_n[None, :] < split_kv_end) & (mask_dv[:, None]),
                     other=0.0,
                 )
-                if v.dtype.is_fp8():
-                    v = (v.to(tl.float32) * vs).to(q.dtype)
+                if vT.dtype.is_fp8():
+                    vT = (vT.to(tl.float32) * vs).to(q.dtype)
+                v = tl.trans(vT)
             else:
                 # MLA uses a single c_kv.
                 # loading the same c_kv to interpret it as v is not necessary.
@@ -482,10 +505,36 @@ def _decode_grouped_att_m_fwd(
     v_scale,
     is_mla=False,
 ):
-    # with is_mla there is only a single c_kv in smem.
-    # could increase BLOCK or num_stages.
-    Lk = k_buffer.shape[-1]
-    Lv = v_buffer.shape[-1]
+    # Layout contract (see _fwd_grouped_kernel_stage1):
+    #   real ROCm: K (nb, Hkv, D/x, PAGE, x) [5D], V (nb, Hkv, D, PAGE) [4D]
+    #   legacy:    K/V (..., PAGE, H, D) with head dim at -2
+    if k_buffer.ndim == 5:
+        Lk = k_buffer.shape[2] * k_buffer.shape[4]
+        Lv = v_buffer.shape[2]
+        x_pack = k_buffer.shape[-1]
+        kv_group_num = q.shape[1] // k_buffer.shape[1]
+        k_strides = k_buffer.stride()
+        v_strides = v_buffer.stride()
+    else:
+        Lk = k_buffer.shape[-1]
+        Lv = v_buffer.shape[-1]
+        x_pack = 1
+        kv_group_num = q.shape[1] // k_buffer.shape[-2]
+        # Map (..., PAGE, H, D) onto the kernel's (block, head, d/x, token, x)
+        # addressing with x = 1.
+        k_strides = (
+            _page_stride(k_buffer, page_size),
+            k_buffer.stride(-2),
+            1,
+            k_buffer.stride(-3),
+            0,
+        )
+        v_strides = (
+            _page_stride(v_buffer, page_size),
+            v_buffer.stride(-2),
+            1,
+            v_buffer.stride(-3),
+        )
 
     # Align tile dimensions with latent rank for MLA to avoid shape mismatch.
     if is_mla:
@@ -508,7 +557,6 @@ def _decode_grouped_att_m_fwd(
         BLOCK = 16
 
     batch, head_num = q.shape[0], q.shape[1]
-    kv_group_num = q.shape[1] // k_buffer.shape[-2]
 
     BLOCK_H = 16
     NUM_KV_SPLITS = num_kv_splits
@@ -542,12 +590,15 @@ def _decode_grouped_att_m_fwd(
         Req_to_tokens.stride(0),
         q.stride(0),
         q.stride(1),
-        _page_stride(k_buffer, page_size),
-        k_buffer.stride(-3),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
-        k_buffer.stride(-2),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
-        _page_stride(v_buffer, page_size),
-        v_buffer.stride(-3),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
-        v_buffer.stride(-2),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
+        k_strides[0],
+        k_strides[1],
+        k_strides[2],
+        k_strides[3],
+        k_strides[4],
+        v_strides[0],
+        v_strides[1],
+        v_strides[2],
+        v_strides[3],
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),
@@ -567,6 +618,7 @@ def _decode_grouped_att_m_fwd(
         num_stages=num_stages,
         Lk=Lk,
         Lv=Lv,
+        x_pack=x_pack,
         IS_MLA=is_mla,
         **extra_kargs,
     )
@@ -649,7 +701,10 @@ def _decode_softmax_reducev_fwd(
     num_kv_splits,
 ):
     batch, head_num = q.shape[0], q.shape[1]
-    Lv = v_buffer.shape[-1]
+    # Head dim from the query: the cache layout varies (real ROCm V is
+    # (nb, Hkv, D, PAGE) with the token dim innermost, legacy is
+    # (..., PAGE, H, D)), but the query head dim is unambiguous.
+    Lv = q.shape[2]
     BLOCK_DV = triton.next_power_of_2(Lv)
 
     NUM_KV_SPLITS = num_kv_splits

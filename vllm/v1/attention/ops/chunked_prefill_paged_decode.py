@@ -344,17 +344,17 @@ def _try_flash_decode(
         logger.info(
             "[flash-decode gate] call #%d: num_tokens=%s "
             "q_shape=%s q_dev=%s seq_dev=%s max_query_len=%s "
-            "seq_lens=%s dtype=%s kv_dtype=%s block_size=%s native=%s "
-            "heads=%s head_size=%s causal=%s alibi=%s sinks=%s "
-            "sliding=%s out_scale=%s",
+            "seq_lens=%s dtype=%s kv_dtype=%s kv5_shape=%s kv4_shape=%s "
+            "kv5_strides=%s kv4_strides=%s bt_shape=%s bt_sample=%s",
             _FLASH_DEBUG_LOGGER.calls,
             query.shape[0], tuple(query.shape), query.device,
             seq_lens.device, max_query_len, seq_lens.tolist(),
             query.dtype, kv_cache_dtype,
-            value_cache.shape[3],
-            has_native_kv_cache_layout(key_cache, value_cache),
-            query.shape[1], query.shape[2], causal, alibi_slopes is not None,
-            sinks is not None, sliding_window, output_scale is not None,
+            tuple(key_cache.shape), tuple(value_cache.shape),
+            tuple(key_cache.stride()), tuple(value_cache.stride()),
+            tuple(block_table.shape),
+            block_table[:, :8].tolist() if block_table.shape[1] >= 8
+            else block_table.tolist(),
         )
     if output_scale is not None:
         # no fused output quantization in the flash-decode path
@@ -373,10 +373,23 @@ def _try_flash_decode(
     head_size = query.shape[2]
     if head_size > 256:
         return False
-    real_block_size = value_cache.shape[3]
-    if real_block_size < 2 or (real_block_size & (real_block_size - 1)) != 0:
+    # KV cache: the real ROCm paged layout (strided, token innermost):
+    #   K: (num_blocks, num_kv_heads, head_dim / x, PAGE_SIZE, x)
+    #   V: (num_blocks, num_kv_heads, head_dim, PAGE_SIZE)
+    # PAGE_SIZE is the physical block size: 16 for standard models, but
+    # inflated for hybrid linear-attention models (this one: 1600). The
+    # block table has one row per physical block; the kernel is layout
+    # agnostic via the strides the launcher passes.
+    if key_cache.ndim != 5 or value_cache.ndim != 4:
         return False
-    if not has_native_kv_cache_layout(key_cache, value_cache):
+    real_block_size = value_cache.shape[3]
+    if real_block_size < 2 or key_cache.shape[3] != real_block_size:
+        return False
+    if key_cache.shape[1] != value_cache.shape[1]:
+        return False
+    if key_cache.shape[2] * key_cache.shape[4] != head_size:
+        return False
+    if value_cache.shape[2] != head_size:
         return False
     num_seqs = len(seq_lens)
     num_tokens = query.shape[0]
