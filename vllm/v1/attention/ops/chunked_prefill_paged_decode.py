@@ -19,6 +19,10 @@ from .triton_decode_attention import (
     decode_attention_fwd_grouped,
     decode_attention_fwd_grouped_multiq,
 )
+from .triton_flash_prefill import (
+    _FLASH_PREFILL_BN,
+    flash_prefill_paged_fwd,
+)
 
 logger = init_logger(__name__)
 
@@ -614,29 +618,109 @@ def _standard_context_decode_path(
     use_alibi_slopes = alibi_slopes is not None
 
     if max_query_len > 1:
-        context_attention_fwd(
-            q=query,
-            k=key,
-            v=value,
-            o=output,
-            kv_cache_dtype=kv_cache_dtype,
-            k_cache=key_cache,
-            v_cache=value_cache,
-            b_loc=block_table,
-            b_start_loc=query_start_loc,
-            b_seq_len=seq_lens,
-            max_seq_len=max_seq_len,
-            max_input_len=max_query_len,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            alibi_slopes=alibi_slopes,
-            sliding_window=sliding_window,
-            sm_scale=sm_scale,
-            skip_decode=True,
-            fp8_out_scale=output_scale,
-            sinks=sinks,
-            causal=causal,
+        # Path A (gfx1100): fast paged flash prefill. The cliff kernel
+        # (context_attention_fwd) reads the paged history with 32-token
+        # gather tiles (one block-table lookup per token) and sits at
+        # ~0.12% of the DRAM roofline at 100k context; the flash kernel
+        # reads 64-token tiles with one block-table load per tile and
+        # runs an unmasked history phase + a small causal current-chunk
+        # phase. Gate: conservative, falls back to the cliff kernel.
+        _gate_conds = (
+            ("causal", causal),
+            ("no_alibi", alibi_slopes is None),
+            ("no_sinks", sinks is None),
+            ("no_sw", sliding_window == 0),
+            ("no_oscale", output_scale is None),
+            ("key_not_none", key is not None),
+            ("value_not_none", value is not None),
+            ("not_btp", not is_block_table_ptr),
+            ("bt_i32/64", block_table.dtype in (torch.int32, torch.int64)),
+            ("q_bf16/fp16", query.dtype in (torch.bfloat16, torch.float16)),
+            ("D_ok", query.shape[2] in (64, 128, 256)),
+            (
+                "kc_layout",
+                (
+                    key_cache.dim() == 5
+                    and key_cache.shape[4] in (1, 2, 4, 8, 16, 32)
+                    and key_cache.shape[2] * key_cache.shape[4]
+                    == query.shape[2]
+                    and key_cache.shape[3] == value_cache.shape[3]
+                )
+                or (
+                    key_cache.dim() == 4
+                    and key_cache.shape[2] == query.shape[2]
+                ),
+            ),
+            ("vc_4d", value_cache.dim() == 4),
+            (
+                "pb_mod64",
+                value_cache.shape[3] % _FLASH_PREFILL_BN == 0
+                if value_cache.dim() == 4
+                else False,
+            ),
+            ("hq_mod_hkv", query.shape[1] % key_cache.shape[1] == 0),
+            (
+                "dtype_ok",
+                "fp8" in kv_cache_dtype
+                or key_cache.dtype in (torch.bfloat16, torch.float16),
+            ),
         )
+        _use_flash_prefill = all(c for _, c in _gate_conds)
+        if _use_flash_prefill:
+            kc = key_cache
+            vc = value_cache
+            if "fp8" in kv_cache_dtype:
+                assert kc.dtype in [torch.uint8, current_platform.fp8_dtype()]
+                assert vc.dtype in [torch.uint8, current_platform.fp8_dtype()]
+                if kv_cache_dtype in ("fp8", "fp8_e4m3"):
+                    target_dtype = current_platform.fp8_dtype()
+                elif kv_cache_dtype == "fp8_e5m2":
+                    target_dtype = torch.float8_e5m2
+                else:
+                    target_dtype = None
+                if target_dtype is not None:
+                    kc = kc.view(target_dtype)
+                    vc = vc.view(target_dtype)
+            flash_prefill_paged_fwd(
+                q=query,
+                k=key,
+                v=value,
+                o=output,
+                k_cache=kc,
+                v_cache=vc,
+                b_loc=block_table,
+                b_start_loc=query_start_loc,
+                b_seq_len=seq_lens,
+                max_input_len=max_query_len,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                sm_scale=sm_scale,
+                skip_decode=True,
+            )
+        else:
+            context_attention_fwd(
+                q=query,
+                k=key,
+                v=value,
+                o=output,
+                kv_cache_dtype=kv_cache_dtype,
+                k_cache=key_cache,
+                v_cache=value_cache,
+                b_loc=block_table,
+                b_start_loc=query_start_loc,
+                b_seq_len=seq_lens,
+                max_seq_len=max_seq_len,
+                max_input_len=max_query_len,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                alibi_slopes=alibi_slopes,
+                sliding_window=sliding_window,
+                sm_scale=sm_scale,
+                skip_decode=True,
+                fp8_out_scale=output_scale,
+                sinks=sinks,
+                causal=causal,
+            )
 
     block_size = value_cache.shape[3]
     num_seqs = len(seq_lens)
