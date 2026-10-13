@@ -28,8 +28,9 @@
 #
 # v1 eligibility (host gate, see chunked_prefill_paged_decode.py):
 # causal, no alibi/sinks/sliding-window/fp8-output, dense K/V provided,
-# q in {bf16, fp16}, head dim in {64, 128, 256}, cache x=1 (K 5D with
-# last dim 1, V 4D), PB % BN == 0, native cache layout, int block table.
+# q in {bf16, fp16}, head dim in {64, 128, 256}, K cache 5D x-pack
+# (x in {1, 2, 4, 8, 16, 32}) or 4D, V 4D or x-pack 5D with the same x,
+# PB % BN == 0, native cache layout, int block table.
 
 import os
 
@@ -182,30 +183,33 @@ def _flash_prefill_fwd(
         acc = acc * alpha[:, None]
 
         # V is x-packed exactly like K (5D view (nb, Hkv, D//X, PB, X);
-        # X = 1 degenerates to the legacy (nb, Hkv, D, PB)): each (d, n)
-        # tile row is BN*X contiguous bytes, so DRAM efficiency is
-        # preserved (token-major (n, d) rows were tested and are
-        # pathological in the full kernel on this driver).
+        # 4D V / X = 1 degenerates to the legacy (nb, Hkv, D, PB) form).
+        # Loaded directly as [BN, D] (transposed pointer form, no
+        # tl.trans between load and dot: ~2.5% faster at 100k ctx on
+        # the W7800, tmp/prefill_tile_bench.py 2026-10-13). Each slot
+        # row is X contiguous bytes; token-major (n, d) rows were
+        # tested and are pathological in the full kernel on this
+        # driver.
         off_v = (
             pb * stride_v_cache_bs
             + cur_kv_head * stride_v_cache_h
-            + (offs_d[:, None] // X) * stride_v_cache_d
-            + in_block[None, :] * stride_v_cache_bl
-            + (offs_d[:, None] % X) * stride_v_cache_inner
+            + in_block[:, None] * stride_v_cache_bl
+            + (offs_d[None, :] // X) * stride_v_cache_d
+            + (offs_d[None, :] % X) * stride_v_cache_inner
         )
         if last:
             v_load = tl.load(
                 V_cache + off_v,
-                mask=(start_n + offs_n[None, :]) < ctx_len,
+                mask=(start_n + offs_n[:, None]) < ctx_len,
                 other=0.0,
             )
         else:
-            v_load = tl.load(V_cache + off_v)  # [D, BN]
+            v_load = tl.load(V_cache + off_v)  # [BN, D]
         if USE_FP8:
             v = (v_load.to(tl.float32) * tl.load(v_scale)).to(q.dtype)
         else:
             v = v_load
-        acc = tl.dot(p.to(v.dtype), tl.trans(v), acc=acc)  # v: [D, BN] -> [BN, D]
+        acc = tl.dot(p.to(v.dtype), v, acc=acc)  # v: [BN, D]
         l_i = l_i * alpha + l_ij
         m_i = m_ij
 
@@ -295,6 +299,10 @@ def flash_prefill_paged_fwd(
     )
     if k_cache.dim() == 5:
         assert k_cache.shape[2] * X == D and k_cache.shape[3] == v_cache.shape[3]
+    if v_cache.dim() == 5:
+        assert v_cache.shape[2] * v_cache.shape[4] == D and v_cache.shape[4] == X, (
+            f"x-pack V mismatch: D={D}, X={X}, v_cache={tuple(v_cache.shape)}"
+        )
     PB = v_cache.shape[3]
     use_fp8 = k_cache.dtype.is_floating_point and k_cache.element_size() == 1
 

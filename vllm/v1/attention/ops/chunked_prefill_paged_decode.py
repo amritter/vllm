@@ -664,13 +664,22 @@ def _standard_context_decode_path(
                     and key_cache.shape[2] == query.shape[2]
                 ),
             ),
-            ("vc_4d", value_cache.dim() == 4),
             (
-                "pb_mod64",
-                value_cache.shape[3] % _FLASH_PREFILL_BN == 0
-                if value_cache.dim() == 4
-                else False,
+                "vc_4d/5d",
+                value_cache.dim() in (4, 5)
+                and (
+                    value_cache.dim() == 4
+                    or (
+                        # x-pack V (nb, Hkv, D//x, PAGE, x): same x as the
+                        # K cache (the kernel uses one X for both), head
+                        # size must match.
+                        value_cache.shape[4] == key_cache.shape[4]
+                        and value_cache.shape[2] * value_cache.shape[4]
+                        == query.shape[2]
+                    )
+                ),
             ),
+            ("pb_mod_bn", value_cache.shape[3] % _FLASH_PREFILL_BN == 0),
             ("hq_mod_hkv", query.shape[1] % key_cache.shape[1] == 0),
             (
                 "dtype_ok",
@@ -679,6 +688,20 @@ def _standard_context_decode_path(
             ),
         )
         _use_flash_prefill = all(c for _, c in _gate_conds)
+        if not _use_flash_prefill:
+            _bad = [n for n, c in _gate_conds if not c]
+            logger.warning_once(
+                "Path A flash prefill gate FAILED on %s; falling back to "
+                "the cliff kernel. kc=%s vc=%s q_len=%d",
+                _bad, tuple(key_cache.shape), tuple(value_cache.shape),
+                max_query_len,
+            )
+        else:
+            logger.info_once(
+                "Path A flash prefill gate passed. kc=%s vc=%s q_len=%d",
+                tuple(key_cache.shape), tuple(value_cache.shape),
+                max_query_len,
+            )
         if _use_flash_prefill:
             kc = key_cache
             vc = value_cache
