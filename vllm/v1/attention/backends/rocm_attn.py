@@ -483,9 +483,11 @@ class RocmAttentionImpl(AttentionImpl):
         )
 
         # Reshape the input keys and values and store them in the cache.
-        # Get the actual block_size from value_cache
-        # value_cache shape: [num_blocks, num_heads, head_size, block_size]
-        block_size = value_cache.shape[3]
+        # Get the actual block_size from the K view — its slot dim is at
+        # index 3 for every layout (V now uses the same x-packed 5D view,
+        # so both shapes agree; value_cache.shape[3] would also work but
+        # key_cache is the reference layout).
+        block_size = key_cache.shape[3]
         has_native_layout = has_native_kv_cache_layout(key_cache, value_cache)
 
         if block_size in (16, 32) and has_native_layout:

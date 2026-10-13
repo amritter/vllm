@@ -296,6 +296,7 @@ def _fwd_grouped_kernel_stage1(
     stride_buf_v1,
     stride_buf_v2,
     stride_buf_v3,
+    stride_buf_v4,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -434,20 +435,26 @@ def _fwd_grouped_kernel_stage1(
             )
 
             if not IS_MLA:
-                kv_off_v = kv_page_number * stride_buf_v0 + kv_in_page * stride_buf_v3
+                # V is x-packed exactly like K (5D view
+                # (nb, Hkv, D//x, PAGE, x); x = 1 degenerates to the legacy
+                # (nb, Hkv, D, PAGE)): load the (BLOCK_DV, BLOCK_N) tile with
+                # K-style x-pack offsets so each tile row is a contiguous
+                # x*BLOCK_N byte run (256 B with x=16), then transpose.
                 offs_buf_v = (
-                    kv_off_v[None, :]
+                    kv_page_number[None, :] * stride_buf_v0
                     + base_offs_v
-                    + offs_dv[:, None] * stride_buf_v2
+                    + (offs_dv[:, None] // x_pack) * stride_buf_v2
+                    + kv_in_page[None, :] * stride_buf_v3
+                    + (offs_dv[:, None] % x_pack) * stride_buf_v4
                 )
                 vT = tl.load(
                     V_Buffer + offs_buf_v,
                     mask=(offs_n[None, :] < split_kv_end) & (mask_dv[:, None]),
                     other=0.0,
-                )
-                if vT.dtype.is_fp8():
-                    vT = (vT.to(tl.float32) * vs).to(q.dtype)
-                v = tl.trans(vT)
+                )  # (BLOCK_DV, BLOCK_N)
+                v = tl.trans(vT)  # (BLOCK_N, BLOCK_DV)
+                if v.dtype.is_fp8():
+                    v = (v.to(tl.float32) * vs).to(q.dtype)
             else:
                 # MLA uses a single c_kv.
                 # loading the same c_kv to interpret it as v is not necessary.
@@ -511,6 +518,7 @@ def _fwd_grouped_kernel_stage1_multiq(
     stride_buf_v1,
     stride_buf_v2,
     stride_buf_v3,
+    stride_buf_v4,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -621,20 +629,25 @@ def _fwd_grouped_kernel_stage1_multiq(
                         & (offs_n[None, :] < split_kv_end))
             qk = tl.where(row_valid[:, None] & col_mask, qk, float("-inf"))
 
-            kv_off_v = kv_page_number * stride_buf_v0 + kv_in_page * stride_buf_v3
+            # V is x-packed exactly like K (5D view
+            # (nb, Hkv, D//x, PAGE, x); x = 1 degenerates to the legacy
+            # (nb, Hkv, D, PAGE)): load the (BLOCK_DV, BLOCK_N) tile with
+            # K-style x-pack offsets so each tile row is a contiguous
+            # x*BLOCK_N byte run (256 B with x=16), then transpose.
             offs_buf_v = (
-                kv_off_v[None, :]
+                kv_page_number[None, :] * stride_buf_v0
                 + base_offs_v
-                + offs_dv[:, None] * stride_buf_v2
+                + (offs_dv[:, None] // x_pack) * stride_buf_v2
+                + kv_in_page[None, :] * stride_buf_v3
+                + (offs_dv[:, None] % x_pack) * stride_buf_v4
             )
             vT = tl.load(
                 V_Buffer + offs_buf_v,
                 mask=(offs_n[None, :] < split_kv_end) & (mask_dv[:, None]),
                 other=0.0,
-            )
-            if vT.dtype.is_fp8():
-                vT = (vT.to(tl.float32) * vs).to(q.dtype)
-            v = tl.trans(vT)
+            )  # (BLOCK_DV, BLOCK_N)
+            v = (vT.to(tl.float32) * vs).to(tl.float16)
+            v = tl.trans(v)  # (BLOCK_N, BLOCK_DV)
 
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
             # Rows with no visible key in this split keep n_e_max == -inf:
@@ -775,7 +788,7 @@ def _decode_grouped_att_m_fwd(
     #   legacy:    K/V (..., PAGE, H, D) with head dim at -2
     if k_buffer.ndim == 5:
         Lk = k_buffer.shape[2] * k_buffer.shape[4]
-        Lv = v_buffer.shape[2]
+        Lv = v_buffer.shape[2] * v_buffer.shape[4]
         x_pack = k_buffer.shape[-1]
         kv_group_num = q.shape[1] // k_buffer.shape[1]
         k_strides = k_buffer.stride()
@@ -864,6 +877,7 @@ def _decode_grouped_att_m_fwd(
         v_strides[1],
         v_strides[2],
         v_strides[3],
+        v_strides[4] if len(v_strides) > 4 else 0,
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),
@@ -911,7 +925,7 @@ def _decode_grouped_att_m_fwd_multiq(
     # 4D V token-innermost, or legacy (..., PAGE, H, D)).
     if k_buffer.ndim == 5:
         Lk = k_buffer.shape[2] * k_buffer.shape[4]
-        Lv = v_buffer.shape[2]
+        Lv = v_buffer.shape[2] * v_buffer.shape[4]
         x_pack = k_buffer.shape[-1]
         kv_group_num = q.shape[1] // k_buffer.shape[1]
         k_strides = k_buffer.stride()
@@ -983,6 +997,7 @@ def _decode_grouped_att_m_fwd_multiq(
         v_strides[1],
         v_strides[2],
         v_strides[3],
+        v_strides[4] if len(v_strides) > 4 else 0,
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),

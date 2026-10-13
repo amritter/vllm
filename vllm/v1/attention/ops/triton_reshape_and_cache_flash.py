@@ -46,6 +46,8 @@ def reshape_and_cache_kernel_flash(
     head_stride: tl.int64,
     dim_stride_k: tl.int64,
     dim_stride_v: tl.int64,
+    slot_stride_v: tl.int64,
+    inner_stride_v: tl.int64,
     page_stride: tl.int64,
     num_heads: tl.constexpr,
     head_size: tl.constexpr,
@@ -76,12 +78,18 @@ def reshape_and_cache_kernel_flash(
         # Decompose the tile index back into head and dim coordinates.
         cur_head = tile_pos // head_size
         cur_dim = tile_pos % head_size
-        # Value addressing (4D): [Block, Head, Dim, Slot]
+        # Value addressing (5D, same x-packed view as K):
+        # [Block, Head, Dim//x, Slot, x] (gfx1100 fork; see
+        # split_kv_cache). The decode kernels stream KV in (dim, token)
+        # tiles, and x-packing makes each tile row a contiguous run of
+        # x bytes (256 B with x=16), 1x cache-line over-fetch. With x=1
+        # the formula degenerates to the legacy (..., Dim, Slot).
         tgt_idx_v = (
             block_idx * block_stride
             + cur_head * head_stride
-            + cur_dim * dim_stride_v
-            + block_offset * 1
+            + (cur_dim // x) * dim_stride_v
+            + block_offset * slot_stride_v
+            + (cur_dim % x) * inner_stride_v
         )
         # Key addressing (5D): [Block, Head, Dim//8, Slot, 8]
         tgt_idx_k = (
@@ -381,12 +389,20 @@ def triton_reshape_and_cache_flash(
         x = key_cache.shape[4]
         head_stride = key_cache.stride(1)
         dim_stride_k = key_cache.stride(2)
+        # V view: same x-packed 5D view as K (gfx1100 fork;
+        # split_kv_cache): (nb, Hkv, head_size // x, PAGE, x).
         dim_stride_v = value_cache.stride(2)
+        slot_stride_v = value_cache.stride(3)
+        inner_stride_v = value_cache.stride(4)
     else:
         block_size = key_cache.shape[1]
         x = 1
         dim_stride_k = 0
         dim_stride_v = 0
+        # Legacy 4D V keeps the original literal slot stride (1); with
+        # x = 1 the (cur_dim % x) inner term is always 0.
+        slot_stride_v = 1
+        inner_stride_v = 0
         head_stride = key_cache.stride()[2]
     n = num_heads * head_size
     key_stride = key.stride()[0]
@@ -446,6 +462,8 @@ def triton_reshape_and_cache_flash(
         head_stride=head_stride,
         dim_stride_k=dim_stride_k,
         dim_stride_v=dim_stride_v,
+        slot_stride_v=slot_stride_v,
+        inner_stride_v=inner_stride_v,
         page_stride=page_stride,
         num_heads=num_heads,
         head_size=head_size,

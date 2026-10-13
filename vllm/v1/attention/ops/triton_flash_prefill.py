@@ -90,6 +90,7 @@ def _flash_prefill_fwd(
     stride_v_cache_h,
     stride_v_cache_d,
     stride_v_cache_bl,
+    stride_v_cache_inner,
     num_queries_per_kv: tl.constexpr,
     D: tl.constexpr,
     X: tl.constexpr,
@@ -180,11 +181,17 @@ def _flash_prefill_fwd(
         alpha = tl.where(m_i == float("-inf"), 0.0, alpha)
         acc = acc * alpha[:, None]
 
+        # V is x-packed exactly like K (5D view (nb, Hkv, D//X, PB, X);
+        # X = 1 degenerates to the legacy (nb, Hkv, D, PB)): each (d, n)
+        # tile row is BN*X contiguous bytes, so DRAM efficiency is
+        # preserved (token-major (n, d) rows were tested and are
+        # pathological in the full kernel on this driver).
         off_v = (
             pb * stride_v_cache_bs
             + cur_kv_head * stride_v_cache_h
-            + offs_d[:, None] * stride_v_cache_d
+            + (offs_d[:, None] // X) * stride_v_cache_d
             + in_block[None, :] * stride_v_cache_bl
+            + (offs_d[:, None] % X) * stride_v_cache_inner
         )
         if last:
             v_load = tl.load(
@@ -326,6 +333,7 @@ def flash_prefill_paged_fwd(
         stride_v_cache_h=v_cache.stride(1),
         stride_v_cache_d=v_cache.stride(2),
         stride_v_cache_bl=v_cache.stride(3),
+        stride_v_cache_inner=v_cache.stride(4) if v_cache.dim() == 5 else 0,
         num_queries_per_kv=num_queries_per_kv,
         D=D,
         X=X,

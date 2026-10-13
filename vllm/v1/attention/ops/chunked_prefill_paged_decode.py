@@ -98,6 +98,7 @@ def kernel_paged_attention_2d(
     stride_v_cache_1: tl.int64,  # int
     stride_v_cache_2: tl.int64,  # int
     stride_v_cache_3: tl.int64,  # int
+    stride_v_cache_4: tl.int64,  # int
     filter_by_query_len: tl.constexpr,  # bool
     query_start_len_ptr,  # [num_seqs+1]
     USE_SINKS: tl.constexpr,  # bool
@@ -188,13 +189,18 @@ def kernel_paged_attention_2d(
             + (offs_d[:, None] % x) * stride_k_cache_4
         )
 
-        # 4D addressing logic of V (Slot is innermost)
         v_offset = (
-            p_block_idx[:, None] * stride_v_cache_0
+            p_block_idx[None, :] * stride_v_cache_0
             + kv_head_idx * stride_v_cache_1
-            + offs_d[None, :] * stride_v_cache_2
-            + internal_offsets[:, None] * stride_v_cache_3
+            + (offs_d[:, None] // x) * stride_v_cache_2
+            + internal_offsets[None, :] * stride_v_cache_3
+            + (offs_d[:, None] % x) * stride_v_cache_4
         )
+
+        # 5D x-pack addressing of V, mirroring K: (nb, Hkv, D//x, PAGE, x)
+        # (x = 1 degenerates to the legacy (nb, Hkv, D, PAGE)). Loaded as a
+        # (HEAD_SIZE, BLOCK_SIZE) tile so each tile row is BLOCK_SIZE*x
+        # contiguous bytes, then transposed.
 
         # Only the final tile can straddle seq_len. Slots >= seq_len are
         # unwritten KV cache that may hold NaN/garbage; they are score-masked
@@ -213,7 +219,7 @@ def kernel_paged_attention_2d(
             )
             V_load = tl.load(
                 value_cache_ptr + v_offset,
-                mask=dim_mask[None, :] & kv_load_mask[:, None],
+                mask=dim_mask[:, None] & kv_load_mask[None, :],
                 other=0.0,
                 eviction_policy="evict_last",
             )
@@ -226,7 +232,7 @@ def kernel_paged_attention_2d(
             )
             V_load = tl.load(
                 value_cache_ptr + v_offset,
-                mask=dim_mask[None, :],
+                mask=dim_mask[:, None],
                 other=0.0,
                 eviction_policy="evict_last",
             )
@@ -240,6 +246,7 @@ def kernel_paged_attention_2d(
             V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
         else:
             V = V_load
+        V = tl.trans(V)  # (BLOCK_SIZE, HEAD_SIZE_PADDED)
 
         seq_offset = j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         boundary = tl.full([BLOCK_SIZE], seq_len, dtype=tl.int32)
@@ -358,11 +365,14 @@ def _try_flash_decode(
     # KV cache: the real ROCm paged layout (strided, token innermost):
     #   K: (num_blocks, num_kv_heads, head_dim / x, PAGE_SIZE, x)
     #   V: (num_blocks, num_kv_heads, head_dim, PAGE_SIZE)
+    #     or x-packed exactly like K: (num_blocks, num_kv_heads,
+    #     head_dim / x, PAGE_SIZE, x) -- the 4x-over-fetch fix for the
+    #     multiq stage1 V load (docs: x-pack V, 2026-10-13).
     # PAGE_SIZE is the physical block size: 16 for standard models, but
     # inflated for hybrid linear-attention models (this one: 1600). The
     # block table has one row per physical block; the kernel is layout
     # agnostic via the strides the launcher passes.
-    if key_cache.ndim != 5 or value_cache.ndim != 4:
+    if key_cache.ndim != 5 or value_cache.ndim not in (4, 5):
         return False
     real_block_size = value_cache.shape[3]
     if real_block_size < 2 or key_cache.shape[3] != real_block_size:
@@ -371,7 +381,10 @@ def _try_flash_decode(
         return False
     if key_cache.shape[2] * key_cache.shape[4] != head_size:
         return False
-    if value_cache.shape[2] != head_size:
+    if value_cache.ndim == 4:
+        if value_cache.shape[2] != head_size:
+            return False
+    elif value_cache.shape[2] * value_cache.shape[4] != head_size:
         return False
     num_seqs = len(seq_lens)
     num_tokens = query.shape[0]
@@ -883,6 +896,9 @@ def _standard_context_decode_path(
             stride_v_cache_1=value_cache.stride(1),
             stride_v_cache_2=value_cache.stride(2),
             stride_v_cache_3=value_cache.stride(3),
+            stride_v_cache_4=value_cache.stride(4)
+            if value_cache.dim() == 5
+            else 0,
             filter_by_query_len=True,
             query_start_len_ptr=query_start_loc,
             USE_SINKS=sinks is not None,
@@ -957,7 +973,7 @@ def _try_mixed_decode_prefill_split(
     head_size = query.shape[2]
     if head_size > 256:
         return False
-    if key_cache.ndim != 5 or value_cache.ndim != 4:
+    if key_cache.ndim != 5 or value_cache.ndim not in (4, 5):
         return False
     real_block_size = value_cache.shape[3]
     if real_block_size < 2 or key_cache.shape[3] != real_block_size:
@@ -966,7 +982,10 @@ def _try_mixed_decode_prefill_split(
         return False
     if key_cache.shape[2] * key_cache.shape[4] != head_size:
         return False
-    if value_cache.shape[2] != head_size:
+    if value_cache.ndim == 4:
+        if value_cache.shape[2] != head_size:
+            return False
+    elif value_cache.shape[2] * value_cache.shape[4] != head_size:
         return False
 
     # --- per-request query lengths (the one D2H sync of this path) ---

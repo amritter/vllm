@@ -55,6 +55,7 @@ def _paged_kv_cache_offsets(
     stride_v_cache_h,
     stride_v_cache_d,
     stride_v_cache_bl,
+    stride_v_cache_x,
     PHYSICAL_BLOCK_SIZE: tl.constexpr,
     MASK_BLOCK_TABLE: tl.constexpr = False,
 ):
@@ -65,7 +66,9 @@ def _paged_kv_cache_offsets(
     tiles), then the physical element offsets are built with the same layout the
     kernel uses everywhere:
       K cache: [num_blocks, num_kv_heads, head_size // x, block_size, x]
-      V cache: [num_blocks, num_kv_heads, head_size, block_size]
+      V cache: [num_blocks, num_kv_heads, head_size // x, block_size, x]
+      (same x-packed view as K; x = 1 degenerates to the legacy
+      [num_blocks, num_kv_heads, head_size, block_size])
     Returns `(off_k, off_v)` with shapes [D, N] and [N, D] respectively.
 
     When `MASK_BLOCK_TABLE` is set, the block-table load is masked with
@@ -97,8 +100,9 @@ def _paged_kv_cache_offsets(
     off_v = (
         bn[:, None] * stride_v_cache_bs
         + cur_kv_head * stride_v_cache_h
-        + offs_d[None, :] * stride_v_cache_d
+        + (offs_d[None, :] // x) * stride_v_cache_d
         + internal[:, None] * stride_v_cache_bl
+        + (offs_d[None, :] % x) * stride_v_cache_x
     )
     return off_k, off_v
 
@@ -143,6 +147,7 @@ def _fwd_kernel(
     stride_v_cache_h,
     stride_v_cache_d,
     stride_v_cache_bl,
+    stride_v_cache_x,
     num_queries_per_kv: tl.constexpr,
     IN_PRECISION: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -262,6 +267,7 @@ def _fwd_kernel(
             stride_v_cache_h,
             stride_v_cache_d,
             stride_v_cache_bl,
+            stride_v_cache_x,
             PHYSICAL_BLOCK_SIZE,
         )
 
@@ -402,6 +408,7 @@ def _fwd_kernel(
                 stride_v_cache_h,
                 stride_v_cache_d,
                 stride_v_cache_bl,
+                stride_v_cache_x,
                 PHYSICAL_BLOCK_SIZE,
                 MASK_BLOCK_TABLE=True,
             )
@@ -533,6 +540,7 @@ def _fwd_kernel_alibi(
     stride_v_cache_h,
     stride_v_cache_d,
     stride_v_cache_bl,
+    stride_v_cache_x,
     num_queries_per_kv: int,
     IN_PRECISION: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -611,8 +619,9 @@ def _fwd_kernel_alibi(
         off_v = (
             bn[:, None] * stride_v_cache_bs
             + cur_kv_head * stride_v_cache_h
-            + offs_d[None, :] * stride_v_cache_d
+            + (offs_d[None, :] // x) * stride_v_cache_d
             + (start_n + offs_n[:, None]) % block_size * stride_v_cache_bl
+            + (offs_d[None, :] % x) * stride_v_cache_x
         )
         k_load = tl.load(
             K_cache + off_k,
@@ -929,7 +938,8 @@ def context_attention_fwd(
             v_cache.stride(0),
             v_cache.stride(1),
             v_cache.stride(2),
-            v_cache.stride(3),  # [num_blocks, num_kv_heads, head_size, block_size]
+            v_cache.stride(3),  # [num_blocks, num_kv_heads, head_size // x, block_size, x] (x=1: legacy)
+            v_cache.stride(4) if v_cache.dim() == 5 else 0,
             num_queries_per_kv=num_queries_per_kv,
             IN_PRECISION=IN_PRECISION,
             BLOCK_M=BLOCK,
@@ -1004,6 +1014,7 @@ def context_attention_fwd(
         stride_v_cache_h=v_cache.stride(1),
         stride_v_cache_d=v_cache.stride(2),
         stride_v_cache_bl=v_cache.stride(3),
+        stride_v_cache_x=v_cache.stride(4) if v_cache.dim() == 5 else 0,
         BLOCK_SIZE=TRITON_BLOCK_SIZE,
         PHYSICAL_BLOCK_SIZE=real_block_size,
         num_queries_per_kv=num_queries_per_kv,
