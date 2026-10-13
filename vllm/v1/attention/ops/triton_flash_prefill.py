@@ -38,15 +38,22 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-# Tunable via env (tuning sweep, 2026-10-12). Defaults are the measured
-# best on the W7800 for 8192 q @ 50k ctx (bench: 1175 ms = 2.0x over the
-# cliff kernel's 2399 ms; BM=256 overflows the 64 KB LDS budget):
-#   BM=128, BN=64, num_warps=8, num_stages=1.
+# Tunable via env (tuning sweep, 2026-10-13, tmp/wmma_port/vfp_sweep.sh).
+# Defaults are the measured best on the W7800 at the production last-chunk
+# shape (B=1600 q rows, ctx=100k, fp8 x-pack, D=256; cliff_bench.py):
+#   BM=128, BN=64, num_warps=32, num_stages=1 -> 183-186 ms / 21.2-21.5
+#   TF/s, vs 273.9 ms / 14.4 TF/s for the old W=8 default (+48 %).
+# Sweep highlights (100k ctx, ms / TF/s): W4 575/6.8, W8 274/14.4,
+# W16 230/17.1, W32 183/21.5; BN=128 W32 198/19.8; BN=256 and BM=256
+# overflow the 64 KB LDS; BM=64/96/192 lose (arange pow2 + smaller q
+# tile); S=2 never helps (225-315 ms). Oct 12 note for the record:
+# BM=128/BN=64/W8 was the best at 8192 q @ 50k ctx (1175 ms = 2.0x
+# over the cliff kernel's 2399 ms).
 # BN must divide the physical block size (1600 % 64 == 0) for the
 # one-block-table-load-per-tile property.
 PREFILL_BM = int(os.environ.get("VFP_BM", "128"))
 PREFILL_BN = int(os.environ.get("VFP_BN", "64"))
-PREFILL_WARPS = int(os.environ.get("VFP_WARPS", "8"))
+PREFILL_WARPS = int(os.environ.get("VFP_WARPS", "32"))
 PREFILL_STAGES = int(os.environ.get("VFP_STAGES", "1"))
 
 # KV tile size (see file header). Kept separate from the tunable so the
